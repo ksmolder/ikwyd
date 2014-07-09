@@ -1,0 +1,16 @@
+/backup/**
+/etc/ssl/private/*.key
+/mnt/**
+/proc/**
+/sys/**
+/tmp/**
+
+*~
+.cache*
+.gvfs
+.thumbnails*
+lost+found/
+[Cc]ache
+[Tt]mp
+[Tt]emp
+[Tt]rash

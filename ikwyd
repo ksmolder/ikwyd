@@ -1,0 +1,313 @@
+#!/bin/bash
+
+SNAPSHOT_LOG="/tmp/ikwyd.log"
+
+##
+## Functions...
+##
+
+function usage () {
+cat << EOF
+
+    usage: $0 [-h] [-v] -b <configuration>
+    
+    ikwyd is a backup program which uses rsync to copy files to the storage 
+    location. To optimise disk usage, unchanged files are hardlinked to their 
+    previous version instead of copied again.
+    
+    ikwyd supports multiple backup sources. For each source, a configuration 
+    file is placed in ~/.ikwyd/. The filename of the configuration file must be  
+    the name of the configuration as passed by the -c argument, superceeded by 
+    the ".conf" extension.
+	
+    A configuration file contains the following parameters:
+      SRC="<source>"          This can be a local directory or a remote 
+                              directory in the format "username@host:/<path>.
+      DST="<destination>"     Currently, only local folders are supported. A 
+                              subfolder with the config's name is created inside 
+                              this directory. This is done to prevent snapshots 
+                              from getting corrupt when two or more configs 
+                              point to the same destination directory.
+      COPY="true|false"       If set to true, ikwyd will create a new hardlink 
+                              copy of the latest backup. On the next run, ikwyd 
+                              will synchronise the source to this local copy. 
+                              This might increase the total runtime of ikwyd, 
+                              but might also - as a benefit - decrease the time 
+                              needed for actual the synchronisation phase.
+                              If set to false, ikwyd will use rsync's option to 
+                              create a hardlink for unchanged files.
+      EXCLUDE="<file>"        Specifies the file containing a list of files and 
+                              directories to exclude from the backup. The format 
+                              of this file should be as described in the rsync 
+                              man page (see rsync option --exclude-from).
+                              Defaults to "~/.ikwyd/<config>.exclude".
+      INCLUDE="<file>"        Specifies the file containing the exceptions for 
+                              the exclude directive.  The format of this file 
+                              should be as described in the rsync man page (see 
+                              rsync option --include-from).
+                              Defaults to "~/.ikwyd/<config>.include".
+      RSYNC_OPTIONS="..."     Allows the user to overwrite the used rsync 
+                              options.
+                              Defaults to "-aHRXD --delete --delete-excluded".
+      MAILTO="<email>"        If set, the logfile is mailed to this emailadres 
+                              after the creation of the snapshot.
+      MAILSUBJECT="<subject>" If set, this value is used as the subject for the 
+                              email sent to the given emailaddress. Substitution 
+                              is supported for the following parameters:
+                              - %VAULT: Replaced by the vault name
+                              - %DATE: Replaced by the date and time the backup 
+                                started
+                              - %SNAPSHOT: Replaced by the snapshot name (this 
+                                is the date in the format YYYYmmdd)
+                              Defaults to "IKWYD log for %VAULT::%SNAPSHOT"
+    Please note that there is no space between the parameter, the equal sign and 
+    the assigned value (and ikwyd will break if there is one)!
+	
+    ARGUMENTS
+      -c    Backup configuration name
+
+    OPTIONS
+      -h    Show this message
+      -v    Verbose
+EOF
+}
+
+function read_args () {
+	while getopts "hc:v" OPTION; do
+		case $OPTION in
+			h)
+				usage
+				exit
+				;;
+			v)
+				VERBOSE=1
+				;;
+			c)
+				CONFIG_NAME=$OPTARG
+				;;
+			?)
+				usage
+				exit 1
+				;;
+		esac
+	done
+}
+
+function log_error () {
+	echo "`date` - ERROR: $1" >> ${SNAPSHOT_LOG}
+	cat ${SNAPSHOT_LOG}
+	unlock_vault
+	exit 1
+}
+
+function log_info () {
+	echo "`date` - INFO: $1" >> ${SNAPSHOT_LOG}
+}
+
+function lock_vault () {
+	log_info "Locking vault ${VAULT}"
+	
+	if [ -f "${VAULT_DIR}/.lock" ]; then
+		log_error "Vault $CONFIG is locked"
+	else
+		touch "${VAULT_DIR}/.lock"
+		chmod 400 "${VAULT_DIR}/.lock"
+	fi
+}
+
+function unlock_vault () {
+	if [ -f "${VAULT_DIR}/.lock" ]; then
+		log_info "Unlocking vault ${VAULT}"
+		${CMD_RM} "${VAULT_DIR}/.lock"
+	fi
+}
+
+
+##
+## Read options and arguments
+##
+
+CONFIG_NAME=""
+VERBOSE=0
+read_args $@
+if [ -z $CONFIG_NAME ]; then
+	usage
+	exit 1
+fi
+
+
+##
+## Set defaults and load configuration
+##
+
+NAME="ikwyd"
+CONFIG_PATH="${HOME}/.${NAME}"
+CONFIG_BASE="${CONFIG_PATH}/${CONFIG_NAME}"
+CONFIG_FILE="${CONFIG_BASE}.conf"
+MAILSUBJECT="IKWYD log for %VAULT::%SNAPSHOT"
+
+if [ ! -f "${CONFIG_FILE}" ]; then
+	log_error "Unable to load configuration '${CONFIG_NAME}' ('${CONFIG_FILE}')"
+fi;
+
+# Set default values for overwritable options
+COPY=true
+EXCLUDE="${CONFIG_BASE}.exclude"
+INCLUDE="${CONFIG_BASE}.include"
+RSYNC_OPTIONS="-aHRXD --delete --delete-excluded --stats"
+
+if [ ${VERBOSE} -eq 0 ]; then
+	RSYNC_OPTIONS="${RSYNC_OPTIONS} --quiet"
+fi
+
+# Load configuration
+source "${CONFIG_FILE}"
+
+# Reset CONFIG_NAME to make sure it is not overwritten by loading config file
+read_args $@
+VAULT=${CONFIG_NAME}
+CONFIG_PATH="${HOME}/.${NAME}"
+CONFIG_BASE="${CONFIG_PATH}/${CONFIG_NAME}"
+CONFIG_FILE="${CONFIG_BASE}.conf"
+DEFAULT_EXCLUDE="${CONFIG_BASE}.exclude"
+DEFAULT_INCLUDE="${CONFIG_BASE}.include"
+
+# Validate configuration (regex does work in validator, not in bash...)
+# Regular expression to validate the value for a remote source/ destination.
+# Group 0: complete string
+# Group 1: username (empty if not provided)
+# Group 2: FQDN of the host
+# Group 3: hostname
+# Group 4: domain name
+#REMOTE_REGEX="^(?:([a-zA-Z](?:[_\-\.]?[a-zA-Z0-9])*[a-zA-Z0-9]?)@)?(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])(?:\.((?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]{0,61}[a-zA-Z0-9]))*))?)(?::(.*))$"
+# if [[ $SRC =~ $REMOTE_REGEX ]]; then ...
+
+if [ -z ${SRC} ]; then
+	log_error "Invalid source specified for configuration '${CONFIG_NAME}' ('${CONFIG_FILE}'): ${SRC}"
+fi;
+
+if [ -z ${DST} ]; then
+	log_error "Invalid destination specified for configuration '${CONFIG_NAME}' ('${CONFIG_FILE}'): ${DST}"	
+fi;
+
+if [ ${#DST} == "`expr "${DST}" : '.*/'`" ]; then
+	VAULT_DIR="${DST}${VAULT}"
+else
+	VAULT_DIR="${DST}/${VAULT}"
+fi;
+
+DATE=`date`
+SNAPSHOT_NAME=`date +%Y%m%d_%H%M`
+SNAPSHOT_SYNC_BASE="${VAULT_DIR}/base"
+SNAPSHOT_SYNC_DATA="${SNAPSHOT_SYNC_BASE}/snapshot"
+SNAPSHOT_DEST_BASE="${VAULT_DIR}/${SNAPSHOT_NAME}"
+SNAPSHOT_DEST_DATA="${SNAPSHOT_DEST_BASE}/snapshot"
+SNAPSHOT_LOG="${SNAPSHOT_SYNC_BASE}/snapshot.log"
+
+
+##
+## Define commands to use
+##
+
+CMD_COPY="/bin/cp -lR"
+CMD_MKDIR="/bin/mkdir -p"
+CMD_RSYNC="/usr/bin/rsync"
+CMD_MV="/bin/mv"
+CMD_MAIL="/usr/bin/mail"
+CMD_RM="/bin/rm -rf"
+
+# On FreeBSD, rsync is in another directory
+if [[ `uname` = "FreeBSD" ]]; then
+	CMD_RSYNC="/usr/local/bin/rsync"
+fi;
+
+
+##
+## Prepare backup
+##
+
+# Check if temporary snapshot directory exists
+if [ ! -d $SNAPSHOT_SYNC_DATA ]; then
+	$CMD_MKDIR $SNAPSHOT_SYNC_DATA
+fi
+
+${CMD_RM} ${SNAPSHOT_LOG}
+log_info "Snapshot ${VAULT}::${SNAPSHOT_NAME}"
+
+
+# Lock vault...
+lock_vault
+
+# Get the latest succesfull snapshot
+SNAPSHOT_LAST=
+SNAPSHOTS_IN_VAULT=`ls -d ${VAULT_DIR}/[0-9]* 2> /dev/null`
+
+if [ -n "${SNAPSHOTS_IN_VAULT}" ]; then
+	SNAPSHOT_LAST="${SNAPSHOTS_IN_VAULT:(-${#SNAPSHOT_NAME})}/snapshot"
+	RSYNC_OPTIONS="${RSYNC_OPTIONS} --link-dest=${VAULT_DIR}/${SNAPSHOT_LAST}"
+	log_info "Will hardlink unchanged files to snapshot ${VAULT}::${SNAPSHOT_LAST}"
+fi
+
+# Check if provided exclude and include files are valid
+if [ -f $EXCLUDE ]; then
+	RSYNC_OPTIONS="${RSYNC_OPTIONS} --exclude-from ${EXCLUDE}"
+	if [ -f $INCLUDE ]; then
+		RSYNC_OPTIONS="${RSYNC_OPTIONS} --include-from ${INCLUDE}"
+	elif [ "$INCLUDE" != "${DEFAULT_INCLUDE}" ]; then
+		log_error "Could not read include file (${INCLUDE})"
+	fi
+elif [ "$EXCLUDE" != "${DEFAULT_EXCLUDE}" ]; then
+	log_error "Could not read exclude file (${EXCLUDE})"
+fi
+
+RSYNC="${CMD_RSYNC} ${RSYNC_OPTIONS} ${SRC} ${SNAPSHOT_SYNC_DATA}"
+
+log_info "Synchronizing data using ${RSYNC}"
+
+if [ ${VERBOSE} -ne 0 ]; then
+	log_info "Rsync results:"
+fi
+
+$RSYNC >> ${SNAPSHOT_LOG} 2>> ${SNAPSHOT_LOG}
+RSYNC_SUCCESS=$?
+
+##
+## Post backup
+##
+
+if [ ${RSYNC_SUCCESS} -eq 0 ]; then
+	# Rename temporary backup location to snapshot name
+        log_info "Moving backup to ${SNAPSHOT_DEST_BASE}"
+        ${CMD_MV} ${SNAPSHOT_SYNC_BASE} ${SNAPSHOT_DEST_BASE}
+        SNAPSHOT_LOG="${SNAPSHOT_DEST_BASE}/snapshot.log"
+	
+	# Prepare a hardlink copy if desired
+	case ${COPY} in
+        	true|TRUE|1)
+                	if [ ! "${SNAPSHOT_DEST_DATA}" == "${VAULT_DIR}/" ]; then
+                        	log_info "Creating hardlink copy of ${SNAPSHOT_DEST_DATA}"
+	                        ${CMD_MKDIR} ${SNAPSHOT_SYNC_DATA}
+        	                ${CMD_COPY} "${SNAPSHOT_DEST_DATA}" "${SNAPSHOT_SYNC_BASE}"
+                	fi
+                ;;
+	esac
+else
+	log_error "Rsync failed to run properly"
+fi
+
+#Unlock vault
+unlock_vault
+
+if [ -n $MAILTO ]; then
+	MAILSUBJECT=${MAILSUBJECT/"%VAULT"/${VAULT}}
+	MAILSUBJECT=${MAILSUBJECT/"%SNAPSHOT"/${SNAPSHOT_NAME}}
+	MAILSUBJECT=${MAILSUBJECT/"%DATE"/${DATE}}
+	
+	if [ ${RSYNC_SUCCESS} -ne 0 ] || [ ${VERBOSE} -eq 1 ]; then
+		${CMD_MAIL} -s "${MAILSUBJECT}" "${MAILTO}" < ${SNAPSHOT_LOG}
+	fi
+fi
+
+if [ ${RSYNC_SUCCESS} -ne 0 ] || [ ${VERBOSE} -eq 1 ]; then
+                cat ${SNAPSHOT_LOG}
+fi
