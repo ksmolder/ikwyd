@@ -49,6 +49,29 @@ cat << EOF
       RSYNC_OPTIONS="..."     Allows the user to overwrite the used rsync 
                               options.
                               Defaults to "-aHRXD --delete --delete-excluded".
+      MAX_VAULTSIZE=<num>     Maximum total size of the vault, expressed in GB.
+                              Only set a number here, no suffix (such as G or M).
+                              At the end of each backup, ikwyd will verify 
+                              whether the total vault size exeeds the maximum 
+                              defined size in this configuration parameter. If 
+                              this is the case, ikwyd will delete the oldest 
+                              backups recursively until the total vault size is 
+                              below the maximum defined size.
+                              If set to -1, ikwyd will ignore this value. However,
+                              it is highly advisable to configure this parameter 
+                              more strictly and assign a more relaxing value to
+                              MIN_FREESPACE.
+                              Defaults to "unset" (no maximum vaultsize)
+      MIN_FREESPACE=<num>     The minimum free disk space which should be available
+                              at the beginning of the backup process, expressed 
+                              in GB. If the available space is below the value 
+                              defined in this configuration parameter, ikwyd will
+                              delete the oldest backups recursively until the 
+                              minimum free disk space is available. 
+                              Be careful with configuring this value to strict and
+                              use MAX_VAULTSIZE as the first mean to keep the vault-
+                              size within the desired limits.
+                              Defaults to "0"
       MAILTO="<email>"        If set, the logfile is mailed to this emailadres 
                               after the creation of the snapshot.
       MAILSUBJECT="<subject>" If set, this value is used as the subject for the 
@@ -122,6 +145,17 @@ function unlock_vault () {
 	fi
 }
 
+function remove_oldest () {
+    SNAPSHOT_FIRST=
+    SNAPSHOTS_IN_VAULT=`ls -d ${VAULT_DIR}/[0-9]* 2> /dev/null`
+
+    if [ -n "${SNAPSHOTS_IN_VAULT}" ]; then
+        log_info " > Removing snapshot ${SNAPSHOT_FIRST}"
+        SNAPSHOT_FIRST="${SNAPSHOTS_IN_VAULT:$((${#VAULT_DIR}+1)):(${#SNAPSHOT_NAME})}"
+        ${CMD_RM} "${VAULT_DIR}/${SNAPSHOT_FIRST}"
+    fi
+}
+
 
 ##
 ## Read options and arguments
@@ -171,6 +205,7 @@ CONFIG_BASE="${CONFIG_PATH}/${CONFIG_NAME}"
 CONFIG_FILE="${CONFIG_BASE}.conf"
 DEFAULT_EXCLUDE="${CONFIG_BASE}.exclude"
 DEFAULT_INCLUDE="${CONFIG_BASE}.include"
+DEFAULT_MAX_VAULTSIZE=""
 
 # Validate configuration (regex does work in validator, not in bash...)
 # Regular expression to validate the value for a remote source/ destination.
@@ -181,6 +216,7 @@ DEFAULT_INCLUDE="${CONFIG_BASE}.include"
 # Group 4: domain name
 #REMOTE_REGEX="^(?:([a-zA-Z](?:[_\-\.]?[a-zA-Z0-9])*[a-zA-Z0-9]?)@)?(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])(?:\.((?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]{0,61}[a-zA-Z0-9]))*))?)(?::(.*))$"
 # if [[ $SRC =~ $REMOTE_REGEX ]]; then ...
+NUMBER_REGEX='^[0-9]+$'
 
 if [ -z ${SRC} ]; then
 	log_error "Invalid source specified for configuration '${CONFIG_NAME}' ('${CONFIG_FILE}'): ${SRC}"
@@ -195,6 +231,12 @@ if [ ${#DST} == "`expr "${DST}" : '.*/'`" ]; then
 else
 	VAULT_DIR="${DST}/${VAULT}"
 fi;
+if [[ $MAX_VAULTSIZE =~ $NUMBER_REGEX ]]; then
+    # Convert GB to KB
+    MAX_VAULTSIZE=$((MAX_VAULTSIZE*1024*1024))
+else
+    MAX_VAULTSIZE=$DEFAULT_MAX_VAULTSIZE
+fi
 
 DATE=`date`
 SNAPSHOT_NAME=`date +%Y%m%d_%H%M`
@@ -215,6 +257,7 @@ CMD_RSYNC="/usr/bin/rsync"
 CMD_MV="/bin/mv"
 CMD_MAIL="/usr/bin/mail"
 CMD_RM="/bin/rm -rf"
+CMD_DU="/usr/bin/du -sk"
 
 # On FreeBSD, rsync is in another directory
 if [[ `uname` = "FreeBSD" ]]; then
@@ -280,7 +323,7 @@ if [ ${RSYNC_SUCCESS} -eq 0 ]; then
         log_info "Moving backup to ${SNAPSHOT_DEST_BASE}"
         ${CMD_MV} ${SNAPSHOT_SYNC_BASE} ${SNAPSHOT_DEST_BASE}
         SNAPSHOT_LOG="${SNAPSHOT_DEST_BASE}/snapshot.log"
-	
+
 	# Prepare a hardlink copy if desired
 	case ${COPY} in
         	true|TRUE|1)
@@ -295,14 +338,29 @@ else
 	log_error "Rsync failed to run properly"
 fi
 
-#Unlock vault
+# Check vault size
+if [ -n "${MAX_VAULTSIZE}" ]; then
+    DU=`${CMD_DU} ${VAULT_DIR}`
+    DU=(${DU// / })
+    VAULTSIZE=${DU[0]}
+    log_info "Current vault size: ${VAULTSIZE} (max: ${MAX_VAULTSIZE})"
+    # FIXME change to while loop
+    while [[ ${VAULTSIZE} -gt ${MAX_VAULTSIZE} ]]; do
+        remove_oldest
+        DU=`${CMD_DU} ${VAULT_DIR}`
+        DU=(${DU// / })
+        VAULTSIZE=${DU[0]}
+    done
+fi
+
+# Unlock vault
 unlock_vault
 
 if [ -n $MAILTO ]; then
 	MAILSUBJECT=${MAILSUBJECT/"%VAULT"/${VAULT}}
 	MAILSUBJECT=${MAILSUBJECT/"%SNAPSHOT"/${SNAPSHOT_NAME}}
 	MAILSUBJECT=${MAILSUBJECT/"%DATE"/${DATE}}
-	
+
 	if [ ${RSYNC_SUCCESS} -ne 0 ] || [ ${VERBOSE} -eq 1 ]; then
 		${CMD_MAIL} -s "${MAILSUBJECT}" "${MAILTO}" < ${SNAPSHOT_LOG}
 	fi
